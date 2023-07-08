@@ -7,7 +7,23 @@ class Pktgen(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def start(self, throughput: float, nb_pkts: int) -> None:
+    def set_pcap(self, pcap: str) -> None:
+        pass
+
+    @abstractmethod
+    def get_mean_pkt_size(self) -> float:
+        pass
+
+    @abstractmethod
+    def launch(self) -> None:
+        pass
+    
+    @abstractmethod
+    def start(self, capacity: float, nb_pkts: int = 0) -> None:
+        pass
+
+    @abstractmethod
+    def set_rate(self, capacity: float) -> None:
         pass
 
     @abstractmethod
@@ -31,7 +47,15 @@ class Pktgen(metaclass=ABCMeta):
         pass
 
     @abstractmethod
+    def get_nb_rx_bytes(self) -> int:
+        pass
+
+    @abstractmethod
     def get_nb_tx_pkts(self) -> int:
+        pass
+
+    @abstractmethod
+    def get_nb_tx_bytes(self) -> int:
         pass
 
     @abstractmethod

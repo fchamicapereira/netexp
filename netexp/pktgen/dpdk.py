@@ -1,8 +1,9 @@
 import ipaddress
 import time
 
-from typing import Any, Optional, Iterable, Union
+from typing import Any, Optional, Iterable, Union, TextIO
 
+from netexp.helpers import LocalHost, RemoteHost
 from netexp.pktgen import Pktgen
 from netexp.helpers import (
     get_ssh_client,
@@ -10,6 +11,7 @@ from netexp.helpers import (
     remote_command,
     run_console_commands,
     watch_command,
+    get_host_from_hostname,
 )
 
 
@@ -206,59 +208,135 @@ class DpdkPktgen(Pktgen):
         numa_support: bool = False,
         extra_opt: Optional[str] = None,
     ) -> None:
+        self.hostname = pktgen_server
         self.pktgen_ssh_client = get_ssh_client(pktgen_server)
-        pktgen_options = f'-m "{port_map}"'
+        self.dpdk_config = dpdk_config
+        self.port_map = port_map
         self.max_throughput = max_throughput
         self.rx_port = rx_port
         self.tx_port = tx_port
+        self.pcap = pcap
+        self.use_pcap = pcap != None
+        self.config_file = config_file
+        self.log_file = log_file
+        self.promiscuous = promiscuous
+        self.numa_support = numa_support
+        self.extra_opt = extra_opt
 
-        if pcap is not None:
-            pktgen_options += f" -s 0:{pcap}"
-            self.use_pcap = True
-        else:
-            self.use_pcap = False
+        self.pktgen_active = False
+        self.launch()
+    
+    def set_pcap(self, pcap: str) -> None:
+        changed = (not self.use_pcap) or (self.pcap != pcap)
 
-        if config_file is not None:
-            pktgen_options += f" -f {config_file}"
+        self.use_pcap = True
+        self.pcap = pcap
 
-        if log_file is not None:
-            pktgen_options += f" -l {log_file}"
+        if self.pktgen_active and changed:
+            self.close()
+            self.launch()
+            time.sleep(1)
+            self.wait_ready(stdout=False, stderr=False)
+    
+    def launch(self) -> None:
+        assert not self.pktgen_active
 
-        if promiscuous:
+        pktgen_options = f'-m "{self.port_map}"'
+
+        if self.use_pcap:
+            assert self.pcap
+            pktgen_options += f" -s {self.tx_port}:{self.pcap}"
+
+        if self.config_file is not None:
+            pktgen_options += f" -f {self.config_file}"
+
+        if self.log_file is not None:
+            pktgen_options += f" -l {self.log_file}"
+
+        if self.promiscuous:
             pktgen_options += " -P"
 
-        if numa_support:
+        if self.numa_support:
             pktgen_options += " -N"
 
-        if extra_opt is not None:
-            pktgen_options += extra_opt
+        if self.extra_opt is not None:
+            pktgen_options += self.extra_opt
+        
+        if self.log_file:
+            log_file = open(self.log_file, "a")
+        else:
+            log_file = False
 
-        remote_cmd = f"sudo pktgen {dpdk_config} -- {pktgen_options}"
+        remote_cmd = f"sudo pktgen {self.dpdk_config} -- {pktgen_options}"
         self.pktgen = remote_command(
-            self.pktgen_ssh_client, remote_cmd, pty=True, print_command=True
+            self.pktgen_ssh_client, remote_cmd, pty=True, print_command=log_file
         )
-        self.remote_cmd = remote_cmd
-        self.target_pkt_tx = 0
-
+        self.pktgen_active = True
         self.ready = False
 
+        self.remote_cmd = remote_cmd
+        self.target_pkt_tx = 0
+    
+    def get_mean_pkt_size(self) -> float:
+        log_file: Union[bool, TextIO] = False
+
+        if self.log_file:
+            log_file = open(self.log_file, "a")
+
+        host = get_host_from_hostname(self.hostname)
+        remote_cmd =  f"capinfos -z {self.pcap}"
+
+        capinfos_cmd = host.run_command(
+            remote_cmd,
+            print_command=log_file,
+        )
+
+        output = capinfos_cmd.watch(stdout=log_file, stderr=log_file)
+        status = capinfos_cmd.recv_exit_status()
+
+        if status != 0:
+            raise RuntimeError("Error processing remote pcap")
+
+        try:
+            parsed_output = output.split(" ")[-2]
+            mean_pcap_pkt_size = float(parsed_output)
+        except (IndexError, ValueError):
+            raise RuntimeError(
+                f'Error processing remote pcap (capinfos output: "{output}"'
+            )
+
+        return mean_pcap_pkt_size
+
     def wait_ready(self, stdout: bool = True, stderr: bool = True) -> None:
+        assert self.pktgen_active
+
+        # Wait to see if we actually managed to run pktgen successfuly.
+        # Typically we fail here if we forgot to bind ports to DPDK,
+        # or allocate hugepages.
+        if self.pktgen.exit_status_ready() and self.pktgen.recv_exit_status() != 0:
+            self.pktgen_active = False
+            raise Exception("Cannot run pktgen")
+        
         watch_command(
             self.pktgen,
             keyboard_int=self.pktgen.close,
-            stop_pattern="Pktgen:/>",
+            stop_pattern="\r\nPktgen:/>",
             stdout=stdout,
             stderr=stderr,
         )
         self.ready = True
 
     def commands(self, cmds, timeout: float = 0.5) -> None:
+        assert self.pktgen_active
         run_console_commands(
             self.pktgen,
             cmds,
             timeout=timeout,
             console_pattern="\r\nPktgen:/> ",
         )
+    
+    def _send(self, str):
+        self.pktgen.send(bytes(str, "utf-8"))
 
     def set_params(
         self,
@@ -287,11 +365,14 @@ class DpdkPktgen(Pktgen):
             f"range {tx_port} size min {pkt_size}",
             f"range {tx_port} size max {pkt_size}",
         ]
+
         self.commands(commands)
 
     def start(
-        self, throughput: float, nb_pkts: int, tx_port: Optional[int] = None
+        self, capacity: float, nb_pkts: int = 0, tx_port: Optional[int] = None
     ) -> None:
+        assert self.pktgen_active
+
         tx_port = tx_port or self.tx_port
 
         if not self.ready:
@@ -301,18 +382,24 @@ class DpdkPktgen(Pktgen):
         if self.use_pcap:
             commands += [f"enable {tx_port} pcap"]
 
-        rate = throughput / self.max_throughput * 100
-
         self.target_pkt_tx = self.get_nb_tx_pkts() + nb_pkts
 
         commands += [
             f"set {tx_port} count {nb_pkts}",
-            f"set {tx_port} rate {rate}",
+            f"set {tx_port} rate {capacity}",
             f"start {tx_port}",
         ]
+
         self.commands(commands)
+    
+    def set_rate(self, capacity: float, tx_port: Optional[int] = None) -> None:
+        assert capacity > 0 and capacity <= 100
+        tx_port = tx_port or self.tx_port
+        self.commands(f"set {tx_port} rate {capacity}")
 
     def wait_transmission_done(self) -> None:
+        assert self.pktgen_active
+
         pkts_tx = 0
         while pkts_tx < self.target_pkt_tx:
             time.sleep(1)
@@ -324,28 +411,32 @@ class DpdkPktgen(Pktgen):
                 raise RuntimeError("Pktgen is not making progress")
 
     def stop(self, tx_port: Optional[int] = None) -> None:
+        assert self.pktgen_active
         self.commands(f"stop {tx_port or self.tx_port}")
 
     def clear(self) -> None:
-        self.pktgen.send("clr\n")
-        self.wait_ready()
+        assert self.pktgen_active
+        self.commands("clr\n")
 
     def clean_stats(self) -> None:
+        assert self.pktgen_active
         return self.clear()
 
     def close(self) -> None:
-        self.pktgen.send("quit\n")
-        time.sleep(0.1)
-        self.pktgen_ssh_client.close()
+        if self.pktgen_active:
+            self._send("quit\n")
+            time.sleep(0.1)
+            self.pktgen_active = False
 
     def _get_stats(self, subtype: str, stat_name: str, port: int) -> int:
-        self.pktgen.send(
-            f'\nlua \'print(pktgen.portStats("all", "{subtype}")[{port}].'
+        assert self.pktgen_active
+        self._send(
+            f"\nlua 'print(pktgen.portStats(\"all\", \"{subtype}\")[{port}]."
             f"{stat_name})'\n"
         )
         output = watch_command(
             self.pktgen,
-            keyboard_int=lambda: self.pktgen.send("\x03"),
+            keyboard_int=lambda: self._send("\x03"),
             stop_pattern="\r\n\\d+\r\n",
         )
         lines = output.split("\r\n")
@@ -368,8 +459,14 @@ class DpdkPktgen(Pktgen):
     def get_nb_rx_pkts(self, port: Optional[int] = None) -> int:
         return self._get_stats("port", "ipackets", port or self.rx_port)
 
+    def get_nb_rx_bytes(self, port: Optional[int] = None) -> int:
+        return self._get_stats("port", "ibytes", port or self.rx_port)
+    
     def get_nb_tx_pkts(self, port: Optional[int] = None) -> int:
         return self._get_stats("port", "opackets", port or self.tx_port)
+
+    def get_nb_tx_bytes(self, port: Optional[int] = None) -> int:
+        return self._get_stats("port", "obytes", port or self.tx_port)
 
     def get_rx_throughput(self, port: Optional[int] = None) -> int:
         return self.get_mbits_rx(self.rx_port) * 1_000_000
@@ -381,7 +478,6 @@ class DpdkPktgen(Pktgen):
         posix_shell(self.pktgen)
 
     def __del__(self) -> None:
-        self.commands("quit")
-        del self.pktgen
+        self.close()
         self.pktgen_ssh_client.close()
         del self.pktgen_ssh_client

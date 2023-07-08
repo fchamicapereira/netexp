@@ -415,17 +415,38 @@ def remote_command(
 
     return session
 
+def remote_file_exists(
+    host: str,
+    remote_path: str,
+    log_file: Optional[Union[bool, TextIO]] = False,    
+) -> bool:
+    if log_file is True:
+        log_file = sys.stdout
+    elif log_file is False:
+        log_file = None
+
+    cp = subprocess.run(
+        ["ssh", host, "test", "-f", remote_path],
+        stdout=log_file,
+        stderr=log_file
+    )
+
+    return cp.returncode == 0
 
 def upload_file(
     host: str,
     local_path: str,
     remote_path: str,
     log_file: Optional[Union[bool, TextIO]] = False,
+    overwrite: bool = True,
 ):
     if log_file is True:
         log_file = sys.stdout
     elif log_file is False:
         log_file = None
+    
+    if not overwrite and remote_file_exists(host, remote_path, log_file):
+        return
 
     cp = subprocess.run(
         ["scp", "-r", local_path, f"{host}:{remote_path}"],
@@ -521,7 +542,7 @@ def watch_command(
             # This prevents us from missing the last bytes.
             keep_going = continue_running()
 
-            if command.recv_ready():
+            while command.recv_ready():
                 data = command.recv(512)
                 decoded_data = data.decode("utf-8")
                 output += decoded_data
@@ -529,7 +550,7 @@ def watch_command(
                     stdout.write(decoded_data)
                     stdout.flush()
 
-            if command.recv_stderr_ready():
+            while command.recv_stderr_ready():
                 data = command.recv_stderr(512)
                 decoded_data = data.decode("utf-8")
                 output += decoded_data
@@ -570,7 +591,7 @@ def get_ssh_client(
     if "user" in user_config:
         cfg["username"] = user_config["user"]
 
-    if "proxycommand" in user_config:
+    if "proxycommand" in user_config and user_config["proxycommand"]:
         cfg["sock"] = paramiko.ProxyCommand(user_config["proxycommand"])
 
     if "identityfile" in user_config:
